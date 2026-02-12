@@ -13,9 +13,9 @@ import re
 # ========== НАСТРОЙКИ ==========
 TOKEN = "8587086312:AAE9jbbaPZBzU-niDmOK7uhHhpCYSvf_BoU"
 ADMIN_ID = 7603296347
-SUPPORT_USERNAME = "WWWMMMZZZwq"
+SUPPORT_USERNAME = "CryptoDripClubaD"  # ✅ ИЗМЕНЕНО
 CARD_NUMBER = "2200 7012 3329 6489"
-CARD_HOLDER = "Леонид К."  # ✅ ИЗМЕНИЛ
+CARD_HOLDER = "Леонид К."
 
 # Проценты и лимиты
 INTEREST_RATE = 0.024
@@ -161,9 +161,6 @@ async def cmd_start(message: Message):
             f"💰 +{WELCOME_BONUS}₽ на баланс",
             parse_mode="Markdown"
         )
-    else:
-        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-        await db.commit()
     
     if len(args) > 1 and args[1].startswith("ref") and is_new:
         referrer_id = int(args[1].replace("ref", ""))
@@ -213,7 +210,7 @@ async def cmd_start(message: Message):
         reply_markup=keyboard
     )
 
-# === БАЛАНС + ПРОГНОЗ ===
+# === БАЛАНС ===
 @dp.callback_query(lambda c: c.data == "balance")
 async def show_balance(call: CallbackQuery):
     user_id = call.from_user.id
