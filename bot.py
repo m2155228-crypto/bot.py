@@ -1,11 +1,9 @@
 import asyncio
 import logging
-import os
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 import aiosqlite
 import re
@@ -13,7 +11,7 @@ import re
 # ========== НАСТРОЙКИ ==========
 TOKEN = "8587086312:AAE9jbbaPZBzU-niDmOK7uhHhpCYSvf_BoU"
 ADMIN_ID = 7603296347
-SUPPORT_USERNAME = "CryptoDripClubaD"  # ✅ ИЗМЕНЕНО
+SUPPORT_USERNAME = "CryptoDripClubaD"
 CARD_NUMBER = "2200 7012 3329 6489"
 CARD_HOLDER = "Леонид К."
 
@@ -33,16 +31,7 @@ REFERRAL_DEPOSIT_BONUS = 0.05
 PAYOUT_CHANNEL_ID = None
 PAYOUT_CHANNEL_USERNAME = "@moneydrip_payouts"
 SHOW_WITHDRAW_IN_CHANNEL = True
-
-# ========== НАСТРОЙКИ RENDER ==========
-RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL')
-PORT = int(os.environ.get('PORT', 10000))
-WEBHOOK_PATH = f'/webhook/{TOKEN}'
-if RENDER_EXTERNAL_URL:
-    WEBHOOK_URL = f'{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}'
-else:
-    WEBHOOK_URL = None
-# ========================================
+# ================================
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -138,9 +127,7 @@ async def add_history(user_id: int, type: str, amount: float, status: str = "com
     await db.commit()
 
 # === HEALTH CHECK ДЛЯ UPTIMEROBOT ===
-@dp.get("/health")
-async def health_check():
-    """UptimeRobot пингует этот эндпоинт, чтобы Render не спал"""
+async def health_check(request):
     return web.Response(text="OK")
 
 # === СТАРТ ===
@@ -803,36 +790,21 @@ async def back_to_menu(call: CallbackQuery):
         reply_markup=keyboard
     )
 
-# === ЗАПУСК ЧЕРЕЗ ВЕБХУКИ ===
-async def on_startup():
-    """Действия при старте"""
-    if WEBHOOK_URL:
-        await bot.set_webhook(WEBHOOK_URL, allowed_updates=dp.resolve_used_update_types())
+# === ЗАПУСК ЧЕРЕЗ ПОЛЛИНГ ===
+async def main():
+    logging.basicConfig(level=logging.INFO)
     await init_db()
     asyncio.create_task(interest_worker())
-
-async def on_shutdown():
-    """Действия при остановке"""
-    await bot.delete_webhook()
-    await close_db()
-
-def main():
-    """Запуск через aiohttp"""
+    
+    # Запускаем health-check сервер в фоне
     app = web.Application()
+    app.router.add_get("/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    asyncio.create_task(site.start())
     
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-    
-    if WEBHOOK_URL:
-        webhook_handler = SimpleRequestHandler(
-            dispatcher=dp,
-            bot=bot,
-        )
-        webhook_handler.register(app, path=WEBHOOK_PATH)
-        setup_application(app, dp, bot=bot)
-    
-    web.run_app(app, host='0.0.0.0', port=PORT)
+    await dp.start_polling(bot)
 
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())
