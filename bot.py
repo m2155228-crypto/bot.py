@@ -1,3 +1,8 @@
+import os
+if os.environ.get('IS_RENDER_WORKER'):
+    print("✅ Запуск на Render")
+else:
+    print("⚠️ Health check — пропускаем")
 import asyncio
 import logging
 from datetime import datetime
@@ -526,4 +531,5 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+
     asyncio.run(main())
